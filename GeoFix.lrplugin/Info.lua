@@ -1,9 +1,9 @@
 --[[----------------------------------------------------------------------------
 GeoFix - Lightroom Classic plug-in
 
-Copies GPS coordinates onto photos that have none, taking them from the
-geotagged photo that is closest in capture time (within a configurable window).
-Typical use: tag camera RAW files using phone photos shot at the same time.
+Fills missing GPS for a folder tree treated as one project. Coordinates are
+interpolated between surrounding geotagged photos when the travel speed is
+plausible, otherwise copied from the nearest geotagged photo in time.
 ------------------------------------------------------------------------------]]
 
 return {
@@ -17,11 +17,12 @@ return {
 
 	LrLibraryMenuItems = {
 		{
-			title = 'GeoFix: Copy GPS from nearest photo in time...',
+			-- Always available. A root that only contains subfolders can look
+			-- empty in the filmstrip, and that is the folder the tree scope needs.
+			title = 'GeoFix: Fill missing GPS...',
 			file = 'GeoFixMenuItem.lua',
-			enabledWhen = 'photosAvailable',
 		},
 	},
 
-	VERSION = { major = 0, minor = 2, revision = 0, build = 2 },
+	VERSION = { major = 0, minor = 3, revision = 0, build = 3 },
 }

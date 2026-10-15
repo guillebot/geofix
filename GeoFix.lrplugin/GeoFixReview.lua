@@ -49,27 +49,17 @@ local function formatGps(record)
 	return text
 end
 
-local function deltaText(match, offset)
-	local relation
-	if match.delta == 0 then
-		relation = 'Same capture time'
-	elseif match.signedDelta < 0 then
-		relation = 'Donor is ' .. GeoFixCore.formatDuration(match.delta) .. ' earlier'
-	else
-		relation = 'Donor is ' .. GeoFixCore.formatDuration(match.delta) .. ' later'
-	end
-	if offset ~= 0 then
-		relation = string.format('%s   (clock offset %+d s applied to the untagged photo)', relation, offset)
-	end
-	return relation
-end
-
 local function photoColumn(f, heading, pathKey, statusKey, nameKey, metaKey)
 	return f:column {
 		spacing = f:control_spacing(),
 		width = THUMB_W,
 
-		f:static_text { title = heading, font = '<system/bold>' },
+		f:static_text {
+			title = heading,
+			font = '<system/bold>',
+			width = THUMB_W,
+			height_in_lines = 2,
+		},
 
 		f:picture {
 			value = bind(pathKey),
@@ -123,6 +113,7 @@ function GeoFixReview.show(context, plan, settings)
 	props.donorMeta = ''
 	props.positionLabel = ''
 	props.deltaLabel = ''
+	props.donorHeading = 'Geotagged photo (donor)'
 	props.selectedLabel = string.format('%d of %d selected', matchCount, matchCount)
 
 	local tokens = { target = 0, donor = 0 }
@@ -193,7 +184,12 @@ function GeoFixReview.show(context, plan, settings)
 		props.donorName = match.donor.name
 		props.targetMeta = formatTime(match.target.time) .. '\nno GPS'
 		props.donorMeta = formatTime(match.donor.time) .. '\n' .. formatGps(match.donor)
-		props.deltaLabel = deltaText(match, offset)
+		if match.method == 'interpolated' then
+			props.donorHeading = 'Closer geotagged photo'
+		else
+			props.donorHeading = 'Geotagged photo (donor)'
+		end
+		props.deltaLabel = GeoFixCore.deltaLabel(match, offset)
 		suppress = true
 		props.include = included[i] and true or false
 		suppress = false
@@ -206,10 +202,13 @@ function GeoFixReview.show(context, plan, settings)
 		if not thumbs.donor.done then props.donorStatus = 'Preview timed out' end
 	end
 
+	local counts = plan.counts or { interpolated = 0, nearest = 0, exact = 0 }
 	local summary = string.format(
-		'%d match(es) within %s.    %d already had GPS, %d outside the window, %d without a capture time.',
+		'%d match(es): %d interpolated, %d nearest, %d exact.    %d already had GPS, %d outside the window, %d without a capture time.',
 		matchCount,
-		GeoFixCore.formatDuration(settings.maxDeltaSeconds),
+		counts.interpolated or 0,
+		counts.nearest or 0,
+		counts.exact or 0,
 		#plan.alreadyTagged,
 		#plan.tooFar,
 		#plan.noTimestamp)
@@ -217,6 +216,9 @@ function GeoFixReview.show(context, plan, settings)
 	local hint = settings.dryRun
 		and 'Dry run: look through the pairs. Nothing will be written.'
 		or 'Uncheck a match, or skip it, to leave that photo unchanged.'
+	if (counts.interpolated or 0) > 0 then
+		hint = hint .. ' Interpolated matches write a point between the surrounding photos; the photo on the right is only the closer one.'
+	end
 
 	local f = LrView.osFactory()
 
@@ -230,7 +232,12 @@ function GeoFixReview.show(context, plan, settings)
 			height_in_lines = 2,
 		},
 
-		f:static_text { title = hint, font = '<system/small>' },
+		f:static_text {
+			title = hint,
+			font = '<system/small>',
+			width = THUMB_W * 2 + 24,
+			height_in_lines = 2,
+		},
 
 		f:separator { fill_horizontal = 1 },
 
@@ -245,10 +252,15 @@ function GeoFixReview.show(context, plan, settings)
 		f:row {
 			spacing = f:control_spacing() * 2,
 			photoColumn(f, 'Without GPS  (will receive coordinates)', 'targetPath', 'targetStatus', 'targetName', 'targetMeta'),
-			photoColumn(f, 'Geotagged photo  (donor)', 'donorPath', 'donorStatus', 'donorName', 'donorMeta'),
+			photoColumn(f, bind 'donorHeading', 'donorPath', 'donorStatus', 'donorName', 'donorMeta'),
 		},
 
-		f:static_text { title = bind 'deltaLabel', font = '<system/bold>' },
+		f:static_text {
+			title = bind 'deltaLabel',
+			font = '<system/bold>',
+			width = THUMB_W * 2 + 24,
+			height_in_lines = 4,
+		},
 
 		f:row {
 			spacing = f:control_spacing(),
