@@ -276,6 +276,31 @@ eq(Core.scopeTitle('tree'), 'Entire folder tree - one project', 'tree title')
 check(Core.scopeDetail('tree'):find('Subfolder boundaries are ignored', 1, true) ~= nil, 'tree scope ignores subfolders')
 check(Core.scopeDetail('folder'):find('left out', 1, true) ~= nil, 'folder scope excludes subfolders')
 check(Core.scopeDetail('selection'):find('filmstrip', 1, true) ~= nil, 'selection scope explains the filmstrip')
+local parentAndChildren = Core.classifyFolders({
+	{ id = 'root', parentId = nil },
+	{ id = 'a', parentId = 'root' },
+	{ id = 'b', parentId = 'root' },
+	{ id = 'c', parentId = 'root' },
+	{ id = 'd', parentId = 'root' },
+})
+eq(parentAndChildren.kind, 'ancestor', 'parent plus subfolders is one project')
+eq(parentAndChildren.id, 'root', 'project root is the parent folder')
+
+local onlyChildren = Core.classifyFolders({
+	{ id = 'a', parentId = 'parent' },
+	{ id = 'b', parentId = 'parent' },
+	{ id = 'c', parentId = 'parent' },
+	{ id = 'd', parentId = 'parent' },
+})
+eq(onlyChildren.kind, 'siblings', 'subfolders reported without the parent share that parent')
+eq(onlyChildren.parentId, 'parent', 'shared parent is kept')
+eq(Core.classifyFolders({}).kind, 'none', 'no folders')
+eq(Core.classifyFolders({ { id = 'only', parentId = 'higher' } }).kind, 'one', 'one selected folder stays that folder')
+eq(Core.classifyFolders({
+	{ id = 'a', parentId = 'p1' },
+	{ id = 'b', parentId = 'p2' },
+}).kind, 'ambiguous', 'unrelated folders are rejected')
+
 check(Core.singleRootError(0, 'selection') == nil, 'selection does not need a folder')
 check(Core.singleRootError(3, 'selection') == nil, 'selection ignores extra folders')
 check(Core.singleRootError(1, 'tree') == nil, 'one folder is a valid project')
@@ -373,6 +398,50 @@ local bigCsv = Core.buildReport(big, { scope = 'tree', source = 'Trip', copyAlti
 local _, newlines = bigCsv:gsub('\n', '\n')
 eq(newlines, 20001, 'csv has a header plus every photo')
 check(os.clock() - reportStarted < 10, '20k csv finished')
+-- sidecar path and XMP merge ------------------------------------------------
+eq(Core.sidecarPath('C:\\Photos\\Trip\\IMG_0001.CR3'), 'C:\\Photos\\Trip\\IMG_0001.xmp', 'windows raw gets a sibling xmp')
+eq(Core.sidecarPath('/Users/a/b.raw/IMG.NEF'), '/Users/a/b.raw/IMG.xmp', 'dots in a directory stay put')
+eq(Core.sidecarPath('C:\\Photos\\Trip\\photo'), 'C:\\Photos\\Trip\\photo.xmp', 'no extension still gets xmp')
+check(Core.sidecarPath('C:\\Photos\\Trip\\IMG_0001.CR3') ~= 'C:\\Photos\\Trip\\IMG_0001.CR3', 'sidecar is not the image')
+check(Core.sidecarPath('..') == nil, 'parent segment is not a sidecar target')
+local latText, latRef = Core.formatExifCoord(-33.5, true)
+local lonText, lonRef = Core.formatExifCoord(-70.25, false)
+eq(latText, '33,30.000000S', 'south latitude')
+eq(latRef, 'S', 'south ref')
+eq(lonText, '70,15.000000W', 'west longitude')
+eq(lonRef, 'W', 'west ref')
+
+local created = Core.upsertGpsXmp(nil, 41.40338, 2.17403, 12.5)
+check(created:find('exif:GPSLatitude="41,24.202800N"', 1, true) ~= nil, 'new sidecar latitude')
+check(created:find('exif:GPSLongitude="2,10.441800E"', 1, true) ~= nil, 'new sidecar longitude')
+check(created:find('exif:GPSAltitude="1250/100"', 1, true) ~= nil, 'new sidecar altitude')
+check(created:find('IMG_', 1, true) == nil, 'new sidecar has no filename')
+local again = Core.upsertGpsXmp(created, 41.40338, 2.17403, 12.5)
+local _, latCount = again:gsub('exif:GPSLatitude="', '')
+eq(latCount, 1, 'updating a sidecar does not duplicate latitude')
+
+local existing = '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+	.. '<rdf:Description rdf:about="" crs:HasSettings="True" exif:GPSLatitude="1,0.000000N" exif:GPSLongitude="2,0.000000E" exif:GPSAltitude="10/1">'
+	.. '</rdf:Description></rdf:RDF></x:xmpmeta>'
+local merged = Core.upsertGpsXmp(existing, 10, 20, nil)
+check(merged:find('crs:HasSettings="True"', 1, true) ~= nil, 'existing sidecar metadata is kept')
+check(merged:find('exif:GPSLatitude="10,0.000000N"', 1, true) ~= nil, 'existing latitude is replaced')
+check(merged:find('exif:GPSAltitude="10/1"', 1, true) ~= nil, 'altitude is left unchanged when it is not copied')
+check(merged:find('1,0.000000N', 1, true) == nil, 'old latitude is gone')
+
+local elements = '<rdf:Description xmlns:exif="http://ns.adobe.com/exif/1.0/">'
+	.. '<exif:GPSLatitude>1,0.000000N</exif:GPSLatitude><exif:GPSLongitude>2,0.000000E</exif:GPSLongitude></rdf:Description>'
+local elemMerged = Core.upsertGpsXmp(elements, 5, 6, nil)
+check(elemMerged:find('<exif:GPSLatitude>5,0.000000N</exif:GPSLatitude>', 1, true) ~= nil, 'element latitude is replaced')
+local _, elemCount = elemMerged:gsub('<exif:GPSLatitude>', '')
+eq(elemCount, 1, 'element latitude is not duplicated')
+
+local bare = '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" crs:Version="15.0"/></rdf:RDF></x:xmpmeta>'
+local inserted = Core.upsertGpsXmp(bare, 1, 2, nil)
+check(inserted:find('crs:Version="15.0"', 1, true) ~= nil, 'version survives insertion')
+check(inserted:find('exif:GPSLongitude="2,0.000000E"', 1, true) ~= nil, 'longitude is inserted')
+check(Core.upsertGpsXmp('this is not xmp', 1, 2, nil) == nil, 'non-xmp sidecar is refused')
+
 print(string.format('large plan: %.2fs', elapsed))
 
 print(string.format('%d passed, %d failed', passes, failures))

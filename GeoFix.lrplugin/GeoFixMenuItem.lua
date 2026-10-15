@@ -25,6 +25,7 @@ The folder scopes ignore Library filters. They use the folder itself.
 local LrApplication = import 'LrApplication'
 local LrBinding = import 'LrBinding'
 local LrDialogs = import 'LrDialogs'
+local LrFileUtils = import 'LrFileUtils'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrProgressScope = import 'LrProgressScope'
 local LrTasks = import 'LrTasks'
@@ -186,6 +187,11 @@ local function showSettingsDialog(context)
 			title = 'Save a CSV report (filenames, capture times, and coordinates)',
 			value = bind 'writeReport',
 		},
+		f:static_text {
+			title = 'Coordinates are written to the .xmp sidecar beside each photo. The image file is not modified.',
+			width_in_chars = 82,
+			height_in_lines = 2,
+		},
 		},
 	}
 
@@ -234,33 +240,127 @@ local function dedupe(photos)
 	return out
 end
 
+local function activeSources(catalog)
+	local ok, sources = pcall(function() return catalog:getActiveSources() end)
+	if ok and type(sources) == 'table' and #sources > 0 then return sources end
+	local readOk, readSources = pcall(function()
+		local result
+		catalog:withReadAccessDo(function()
+			result = catalog:getActiveSources()
+		end)
+		return result
+	end)
+	if readOk and type(readSources) == 'table' and #readSources > 0 then return readSources end
+	if ok and type(sources) == 'table' then return sources end
+	return {}
+end
+
+local function sourceList(sources)
+	local list = {}
+	if type(sources) ~= 'table' then return list end
+	if #sources > 0 then
+		for _, source in ipairs(sources) do
+			list[#list + 1] = source
+		end
+		return list
+	end
+	for _, source in pairs(sources) do
+		list[#list + 1] = source
+	end
+	return list
+end
+
+local function isFolder(source)
+	if type(source) == 'string' or source == nil then return false end
+	local okChildren, children = pcall(function() return source:getChildFolders() end)
+	if okChildren and type(children) == 'table' then return true end
+	local okPath, path = pcall(function() return source:getPath() end)
+	return okPath and type(path) == 'string' and path ~= ''
+end
+
+local function folderPathAndName(source)
+	local path, name
+	local okPath, rawPath = pcall(function() return source:getPath() end)
+	if okPath and type(rawPath) == 'string' and rawPath ~= '' then path = rawPath end
+	local okName, rawName = pcall(function() return source:getName() end)
+	if okName and type(rawName) == 'string' and rawName ~= '' then name = rawName end
+	return path, name
+end
+
+local function folderLabel(path, name)
+	if type(path) == 'string' and path ~= '' then return path end
+	if type(name) == 'string' and name ~= '' then return name end
+	return 'Selected folder'
+end
+
 local function folderEntries(catalog)
 	local entries, seen = {}, {}
-	local ok, sources = pcall(function() return catalog:getActiveSources() end)
-	if not ok or type(sources) ~= 'table' then return entries end
+	local sources = sourceList(activeSources(catalog))
 	for _, source in ipairs(sources) do
-		if type(source) ~= 'string' then
-			local pathOk, path = pcall(function() return source:getPath() end)
-			if pathOk and type(path) == 'string' and path ~= '' and not seen[path] then
-				seen[path] = true
-				entries[#entries + 1] = { source = source, path = path }
+		if isFolder(source) and not seen[source] then
+			local path, name = folderPathAndName(source)
+			if path and seen[path] then
+				-- The same folder can show up twice with a different object.
+			else
+				seen[source] = true
+				if path then seen[path] = true end
+				local parent = nil
+				local okParent, rawParent = pcall(function() return source:getParent() end)
+				if okParent and isFolder(rawParent) then parent = rawParent end
+				entries[#entries + 1] = {
+					source = source,
+					path = path,
+					name = name,
+					parent = parent,
+				}
 			end
 		end
 	end
+	logger:info(string.format('active sources=%d folders=%d', #sources, #entries))
 	return entries
 end
 
-local function collectProject(catalog, settings)
+local function chooseFolder(entries)
+	local records = {}
+	local indexOf = {}
+	for i, entry in ipairs(entries) do
+		indexOf[entry.source] = i
+	end
+	for i, entry in ipairs(entries) do
+		local parentId = nil
+		if entry.parent then
+			parentId = indexOf[entry.parent] or entry.parent
+		end
+		records[i] = { id = i, parentId = parentId }
+	end
+
+	local class = GeoFixCore.classifyFolders(records)
+	if class.kind == 'none' then return nil, 'none' end
+	if class.kind == 'ambiguous' then return nil, 'ambiguous' end
+	if class.kind == 'one' or class.kind == 'ancestor' then
+		return entries[class.id], nil
+	end
+
+	local parent = class.parentId
+	if type(parent) == 'number' then parent = entries[parent] and entries[parent].source end
+	if not isFolder(parent) then return nil, 'ambiguous' end
+	local path, name = folderPathAndName(parent)
+	return { source = parent, path = path, name = name }, nil
+end
+
+local function collectProject(catalog, settings, folders)
 	if settings.scope == 'selection' then
 		local photos = catalog:getMultipleSelectedOrAllPhotos() or {}
 		return dedupe(photos), 'Current selection / filmstrip', nil
 	end
 
-	local folders = folderEntries(catalog)
-	local err = GeoFixCore.singleRootError(#folders, settings.scope)
-	if err then return nil, nil, err end
+	if not folders then folders = folderEntries(catalog) end
+	local folder, choice = chooseFolder(folders)
+	if not folder then
+		local count = choice == 'none' and 0 or #folders
+		return nil, nil, GeoFixCore.singleRootError(count, settings.scope)
+	end
 
-	local folder = folders[1]
 	local includeChildren = settings.scope == 'tree'
 	local okPhotos, photos = pcall(function()
 		return folder.source:getPhotos(includeChildren)
@@ -268,7 +368,7 @@ local function collectProject(catalog, settings)
 	if not okPhotos or type(photos) ~= 'table' then
 		return nil, nil, 'Lightroom could not list the photos in the selected folder.\n\n' .. tostring(photos)
 	end
-	return dedupe(photos), folder.path, nil
+	return dedupe(photos), folderLabel(folder.path, folder.name), nil
 end
 
 local function toRecords(catalog, photos, progress)
@@ -426,6 +526,131 @@ local function wantTestMode(settings, matchCount)
 	return answer == 'cancel'
 end
 
+local MAX_SIDECAR_BYTES = 5 * 1024 * 1024
+
+local function readSidecar(path)
+	if not LrFileUtils.exists(path) then return nil, nil end
+	local file, err = io.open(path, 'rb')
+	if not file then return nil, 'could not read sidecar' end
+	local size = file:seek('end')
+	if type(size) == 'number' and size > MAX_SIDECAR_BYTES then
+		file:close()
+		return nil, 'sidecar is too large to update safely'
+	end
+	file:seek('set')
+	local data = file:read('*a')
+	file:close()
+	if not data then return nil, err or 'could not read sidecar' end
+	return data, nil
+end
+
+local function replaceSidecar(path, contents)
+	local tmp = path .. '.geofix.tmp'
+	local file, err = io.open(tmp, 'wb')
+	if not file then return false, err or 'could not create sidecar' end
+	local okWrite, writeErr = pcall(function() file:write(contents) end)
+	file:close()
+	if not okWrite then
+		os.remove(tmp)
+		return false, writeErr or 'could not write sidecar'
+	end
+	if os.rename(tmp, path) then return true end
+	local backup = path .. '.geofix.bak'
+	os.remove(backup)
+	if not os.rename(path, backup) then
+		os.remove(tmp)
+		return false, 'could not replace sidecar'
+	end
+	if not os.rename(tmp, path) then
+		os.rename(backup, path)
+		os.remove(tmp)
+		return false, 'could not replace sidecar'
+	end
+	os.remove(backup)
+	return true
+end
+
+local function writeSidecars(jobs, context)
+	local progress = LrProgressScope {
+		title = 'GeoFix: writing XMP sidecars',
+		functionContext = context,
+	}
+	progress:setCancelable(true)
+
+	local written, failed = 0, 0
+	local failedNames = {}
+	local total = #jobs
+	for i, job in ipairs(jobs) do
+		if progress:isCanceled() then break end
+		progress:setPortionComplete(i, total)
+		progress:setCaption(string.format('%d / %d', i, total))
+		local existing, readErr = readSidecar(job.sidecar)
+		local xml, mergeErr
+		if readErr then
+			xml, mergeErr = nil, readErr
+		else
+			xml, mergeErr = GeoFixCore.upsertGpsXmp(existing, job.latitude, job.longitude, job.altitude)
+		end
+		if not xml then
+			failed = failed + 1
+			if #failedNames < 8 then failedNames[#failedNames + 1] = job.name end
+			logger:warn('sidecar skipped: ' .. tostring(mergeErr))
+		else
+			local ok = replaceSidecar(job.sidecar, xml)
+			if ok then
+				written = written + 1
+			else
+				failed = failed + 1
+				if #failedNames < 8 then failedNames[#failedNames + 1] = job.name end
+				logger:warn('sidecar write failed')
+			end
+		end
+		if LrTasks.yield then LrTasks.yield() end
+	end
+	local canceled = progress:isCanceled()
+	progress:done()
+	return written, failed, failedNames, canceled
+end
+
+local function sidecarJobs(updates)
+	local byPath, order = {}, {}
+	for _, item in ipairs(updates) do
+		local sidecar = GeoFixCore.sidecarPath(item.path)
+		if sidecar then
+			local existing = byPath[sidecar]
+			if not existing then
+				order[#order + 1] = sidecar
+				byPath[sidecar] = {
+					sidecar = sidecar,
+					name = item.name,
+					latitude = item.latitude,
+					longitude = item.longitude,
+					altitude = item.altitude,
+					virtual = item.virtual,
+				}
+			elseif existing.virtual and not item.virtual then
+				byPath[sidecar] = {
+					sidecar = sidecar,
+					name = item.name,
+					latitude = item.latitude,
+					longitude = item.longitude,
+					altitude = item.altitude,
+					virtual = false,
+				}
+			end
+		end
+	end
+	local jobs = {}
+	for _, sidecar in ipairs(order) do
+		jobs[#jobs + 1] = byPath[sidecar]
+	end
+	local missing = 0
+	for _, item in ipairs(updates) do
+		if not GeoFixCore.sidecarPath(item.path) then missing = missing + 1 end
+	end
+	return jobs, missing
+end
+
 local function applyPlan(catalog, plan, settings, context)
 	local progress = LrProgressScope {
 		title = 'GeoFix: writing GPS coordinates',
@@ -434,6 +659,7 @@ local function applyPlan(catalog, plan, settings, context)
 	progress:setCancelable(true)
 
 	local updated = {}
+	local sidecarUpdates = {}
 	local total = #plan.matches
 	local timeout = GeoFixCore.writeTimeoutSeconds(total)
 	logger:info(string.format('writing %d photo(s), timeout %ds', total, timeout))
@@ -449,10 +675,28 @@ local function applyPlan(catalog, plan, settings, context)
 					latitude = gps.latitude,
 					longitude = gps.longitude,
 				})
+				local altitude = nil
 				if settings.copyAltitude and type(m.altitude) == 'number' then
 					photo:setRawMetadata('gpsAltitude', m.altitude)
+					altitude = m.altitude
 				end
 				updated[#updated + 1] = photo
+				local path = m.target.path
+				if type(path) ~= 'string' or path == '' then
+					local okPath, rawPath = pcall(function() return photo:getRawMetadata('path') end)
+					if okPath and type(rawPath) == 'string' then path = rawPath end
+				end
+				local virtual = false
+				local okVirtual, flag = pcall(function() return photo:getRawMetadata('isVirtualCopy') end)
+				if okVirtual and flag then virtual = true end
+				sidecarUpdates[#sidecarUpdates + 1] = {
+					path = path,
+					name = m.target.name,
+					latitude = gps.latitude,
+					longitude = gps.longitude,
+					altitude = altitude,
+					virtual = virtual,
+				}
 			end
 			progress:setPortionComplete(i, total)
 			progress:setCaption(string.format('%d / %d', i, total))
@@ -470,18 +714,28 @@ local function applyPlan(catalog, plan, settings, context)
 		return
 	end
 
-	logger:info(string.format('updated %d photo(s)', #updated))
+	local jobs, missingPaths = sidecarJobs(sidecarUpdates)
+	local sidecarsWritten, sidecarsFailed, failedNames, sidecarsCanceled = writeSidecars(jobs, context)
+	sidecarsFailed = sidecarsFailed + missingPaths
+	logger:info(string.format('updated %d photo(s), sidecars=%d failed=%d', #updated, sidecarsWritten, sidecarsFailed))
 
 	if settings.selectUpdated and #updated > 0 then
 		pcall(function() catalog:setSelectedPhotos(updated[1], updated) end)
 	end
 
-	local msg = string.format('GPS coordinates were copied to %d photo(s).', #updated)
-	if progress:isCanceled() then
+	local msg = string.format(
+		'GPS was saved for %d photo(s) and written to %d XMP sidecar(s). The image files were not modified.',
+		#updated, sidecarsWritten)
+	if progress:isCanceled() or sidecarsCanceled then
 		msg = msg .. ' (canceled before finishing)'
 	end
-	msg = msg .. '\n\nNote: the coordinates live in the catalog. Use Metadata > Save Metadata to File '
-		.. 'if you want them written to the files / XMP sidecars.'
+	if sidecarsFailed > 0 then
+		msg = msg .. string.format('\n\n%d sidecar(s) could not be written.', sidecarsFailed)
+		if #failedNames > 0 then
+			msg = msg .. '\n' .. table.concat(failedNames, '\n')
+		end
+	end
+	msg = msg .. '\n\nThe catalog has the same coordinates, so the location shows in Lightroom and a later metadata save will not wipe the sidecar. Edit > Undo reverts the catalog only, not the .xmp files.'
 	LrDialogs.message('GeoFix', msg, 'info')
 end
 
@@ -490,11 +744,15 @@ end
 --------------------------------------------------------------------------------
 
 local function main(context)
+	-- Read the folder before the settings dialog. A modal dialog can clear the
+	-- Folders-panel selection, which made a selected parent look like no folder.
+	local catalog = LrApplication.activeCatalog()
+	local folders = folderEntries(catalog)
 	local settings = showSettingsDialog(context)
 	if not settings then return end
+	if #folders == 0 then folders = folderEntries(catalog) end
 
-	local catalog = LrApplication.activeCatalog()
-	local photos, sourceLabel, err = collectProject(catalog, settings)
+	local photos, sourceLabel, err = collectProject(catalog, settings, folders)
 	if err then
 		LrDialogs.message('GeoFix', err, 'info')
 		return

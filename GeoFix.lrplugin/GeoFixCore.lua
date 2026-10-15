@@ -437,6 +437,66 @@ function GeoFixCore.scopeDetail(scope)
 	return 'All photos in the selected root folder and every subfolder are analyzed together as one project. Subfolder boundaries are ignored. Any geotagged photo in the tree can supply coordinates to any untagged photo in the tree.'
 end
 
+--- Pick one project folder from the folders Lightroom reported.
+-- Each record is { id = comparable, parentId = comparable or nil }.
+-- parentId may point at another record in the list, or at a parent outside it.
+-- @return { kind = 'one'|'ancestor'|'siblings'|'none'|'ambiguous', id = , parentId = }
+function GeoFixCore.classifyFolders(records)
+	records = records or {}
+	if #records == 0 then return { kind = 'none' } end
+	if #records == 1 then return { kind = 'one', id = records[1].id } end
+
+	local inSet = {}
+	for _, record in ipairs(records) do
+		inSet[record.id] = true
+	end
+
+	local function parentOf(id)
+		for _, record in ipairs(records) do
+			if record.id == id then return record.parentId end
+		end
+		return nil
+	end
+
+	local function reaches(id, target, guard)
+		if id == target then return true end
+		guard = (guard or 0) + 1
+		if guard > 64 then return false end
+		local parentId = parentOf(id)
+		if parentId == nil or not inSet[parentId] then return false end
+		return reaches(parentId, target, guard)
+	end
+
+	local tops = {}
+	for _, record in ipairs(records) do
+		if record.parentId == nil or not inSet[record.parentId] then
+			tops[#tops + 1] = record
+		end
+	end
+
+	if #tops == 1 then
+		local topId = tops[1].id
+		for _, record in ipairs(records) do
+			if not reaches(record.id, topId) then
+				return { kind = 'ambiguous' }
+			end
+		end
+		if topId == records[1].id and #records == 1 then
+			return { kind = 'one', id = topId }
+		end
+		return { kind = 'ancestor', id = topId }
+	end
+
+	local shared = tops[1] and tops[1].parentId or nil
+	if shared == nil then return { kind = 'ambiguous' } end
+	for i = 2, #tops do
+		if tops[i].parentId ~= shared then
+			return { kind = 'ambiguous' }
+		end
+	end
+	return { kind = 'siblings', parentId = shared }
+end
+
 --- Nil when the scope can run. Otherwise a message naming what to select.
 function GeoFixCore.singleRootError(folderCount, scope)
 	if scope == 'selection' then return nil end
@@ -714,6 +774,187 @@ function GeoFixCore.buildReport(plan, meta)
 	end
 
 	return table.concat(lines, '\n') .. '\n'
+end
+
+--- XMP sidecar next to a photo. `IMG_0001.CR3` -> `IMG_0001.xmp` in the same directory.
+-- The image path itself is never returned.
+function GeoFixCore.sidecarPath(photoPath)
+	if type(photoPath) ~= 'string' or photoPath == '' then return nil end
+	local slash = photoPath:match('^.*()[/\\]')
+	local dir, leaf
+	if slash then
+		dir = photoPath:sub(1, slash)
+		leaf = photoPath:sub(slash + 1)
+	else
+		dir = ''
+		leaf = photoPath
+	end
+	if leaf == '' or leaf == '.' or leaf == '..' then return nil end
+	if leaf:find('[/\\]', 1, false) then return nil end
+	local base = leaf:match('^(.*)%.[^%.\\/]+$')
+	if not base or base == '' then base = leaf end
+	if base == '' or base == '.' or base == '..' then return nil end
+	return dir .. base .. '.xmp'
+end
+
+--- EXIF GPS text used by Lightroom sidecars, e.g. "41,24.202800N".
+-- @return text, ref ("N"/"S" or "E"/"W")
+function GeoFixCore.formatExifCoord(degrees, isLatitude)
+	local negative = degrees < 0
+	local ref
+	if isLatitude then
+		ref = negative and 'S' or 'N'
+	else
+		ref = negative and 'W' or 'E'
+	end
+	local absv = math.abs(degrees)
+	local deg = math.floor(absv)
+	local minutes = (absv - deg) * 60
+	if minutes >= 59.9999995 then
+		minutes = 0
+		deg = deg + 1
+	end
+	return string.format('%d,%.6f%s', deg, minutes, ref), ref
+end
+
+local function patternQuote(text)
+	return (text:gsub('(%W)', '%%%1'))
+end
+
+local function exifPrefix(xml)
+	local prefix = xml:match('xmlns:([%w_%-]+)="http://ns%.adobe%.com/exif/1%.0/"')
+	if prefix and prefix ~= '' then return prefix end
+	return 'exif'
+end
+
+local function hasExifTag(xml, prefix, tag)
+	if xml:find(prefix .. ':' .. tag .. '="', 1, true) then return true end
+	if xml:find(prefix .. ':' .. tag .. "='", 1, true) then return true end
+	if xml:find('<' .. prefix .. ':' .. tag .. '>', 1, true) then return true end
+	return false
+end
+
+local function replaceExifTag(xml, prefix, tag, value)
+	local quoted = patternQuote(prefix)
+	local found = false
+	local attr = prefix .. ':' .. tag .. '="'
+	if xml:find(attr, 1, true) then
+		xml = xml:gsub('(' .. quoted .. ':' .. tag .. '=")[^"]*(")', function(open, close)
+			return open .. value .. close
+		end)
+		found = true
+	end
+	local attrSingle = prefix .. ':' .. tag .. "='"
+	if xml:find(attrSingle, 1, true) then
+		xml = xml:gsub('(' .. quoted .. ':' .. tag .. "=')[^']*(')", function(open, close)
+			return open .. value .. close
+		end)
+		found = true
+	end
+	local openElem = '<' .. prefix .. ':' .. tag .. '>'
+	if xml:find(openElem, 1, true) then
+		xml = xml:gsub('(<' .. quoted .. ':' .. tag .. '>%s*)[^<]*(%s*</' .. quoted .. ':' .. tag .. '>)', function(open, close)
+			return open .. value .. close
+		end)
+		found = true
+	end
+	return xml, found
+end
+
+local function looksLikeXmp(xml)
+	return xml:find('x:xmpmeta', 1, true)
+		or xml:find('rdf:RDF', 1, true)
+		or xml:find('<rdf:Description', 1, true)
+end
+
+local function insertExifAttrs(xml, prefix, attrs)
+	local startAt = xml:find('<rdf:Description', 1, true)
+	if not startAt then return nil end
+	local closeAt = xml:find('>', startAt, true)
+	if not closeAt then return nil end
+	local insertAt = closeAt
+	if xml:sub(closeAt - 1, closeAt - 1) == '/' then
+		insertAt = closeAt - 1
+	end
+	local addition = ' ' .. attrs
+	local xmlns = 'xmlns:' .. prefix .. '='
+	if not xml:find(xmlns, 1, true) then
+		addition = ' xmlns:' .. prefix .. '="http://ns.adobe.com/exif/1.0/"' .. addition
+	end
+	return xml:sub(1, insertAt - 1) .. addition .. xml:sub(insertAt)
+end
+
+local function minimalXmp(latText, lonText, altText, altRef)
+	local altitude = ''
+	if altText then
+		altitude = '\n    exif:GPSAltitude="' .. altText .. '"\n    exif:GPSAltitudeRef="' .. altRef .. '"'
+	end
+	return '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+		.. '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="GeoFix">\n'
+		.. ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+		.. '  <rdf:Description rdf:about=""\n'
+		.. '    xmlns:exif="http://ns.adobe.com/exif/1.0/"\n'
+		.. '    exif:GPSLatitude="' .. latText .. '"\n'
+		.. '    exif:GPSLongitude="' .. lonText .. '"' .. altitude .. '>\n'
+		.. '  </rdf:Description>\n'
+		.. ' </rdf:RDF>\n'
+		.. '</x:xmpmeta>\n'
+		.. '<?xpacket end="w"?>\n'
+end
+
+--- Merge GPS into an XMP sidecar. Other tags are left in place.
+-- A nil or blank document becomes a new sidecar. A non-XMP document is refused.
+-- A nil altitude leaves any existing altitude tags unchanged.
+-- @return xml, error
+function GeoFixCore.upsertGpsXmp(existing, latitude, longitude, altitude)
+	if type(latitude) ~= 'number' or type(longitude) ~= 'number' then
+		return nil, 'missing coordinates'
+	end
+	local latText, latRef = GeoFixCore.formatExifCoord(latitude, true)
+	local lonText, lonRef = GeoFixCore.formatExifCoord(longitude, false)
+	local altText, altRef
+	if type(altitude) == 'number' then
+		local hundredths = math.floor(math.abs(altitude) * 100 + 0.5)
+		altText = string.format('%d/100', hundredths)
+		altRef = altitude < 0 and '1' or '0'
+	end
+
+	if existing == nil or existing:match('^%s*$') then
+		return minimalXmp(latText, lonText, altText, altRef), nil
+	end
+	if not looksLikeXmp(existing) then
+		return nil, 'sidecar is not XMP'
+	end
+
+	local xml = existing
+	local prefix = exifPrefix(xml)
+	xml = replaceExifTag(xml, prefix, 'GPSLatitude', latText)
+	xml = replaceExifTag(xml, prefix, 'GPSLongitude', lonText)
+	xml = replaceExifTag(xml, prefix, 'GPSLatitudeRef', latRef)
+	xml = replaceExifTag(xml, prefix, 'GPSLongitudeRef', lonRef)
+	if altText then
+		xml = replaceExifTag(xml, prefix, 'GPSAltitude', altText)
+		xml = replaceExifTag(xml, prefix, 'GPSAltitudeRef', altRef)
+	end
+
+	local missing = {}
+	if not hasExifTag(xml, prefix, 'GPSLatitude') then
+		missing[#missing + 1] = prefix .. ':GPSLatitude="' .. latText .. '"'
+	end
+	if not hasExifTag(xml, prefix, 'GPSLongitude') then
+		missing[#missing + 1] = prefix .. ':GPSLongitude="' .. lonText .. '"'
+	end
+	if altText and not hasExifTag(xml, prefix, 'GPSAltitude') then
+		missing[#missing + 1] = prefix .. ':GPSAltitude="' .. altText .. '"'
+	end
+	if altText and not hasExifTag(xml, prefix, 'GPSAltitudeRef') then
+		missing[#missing + 1] = prefix .. ':GPSAltitudeRef="' .. altRef .. '"'
+	end
+	if #missing > 0 then
+		xml = insertExifAttrs(xml, prefix, table.concat(missing, ' '))
+		if not xml then return nil, 'could not find an XMP description' end
+	end
+	return xml, nil
 end
 
 return GeoFixCore

@@ -35,9 +35,9 @@ The menu stays available even when the root folder looks empty in the grid. A fo
 
 Turn on **Dry run** the first time you point it at a large library. Turn on **Save a CSV report** if you want a spreadsheet of every photo before anything is written. Turn on **Test mode** only for a small set: it opens matches one at a time.
 
-The write is a single catalog step, so **Edit > Undo** reverts it.
+Apply writes each location into the `.xmp` sidecar beside the photo (`IMG_0001.CR3` becomes `IMG_0001.xmp` in the same folder). The image file itself is not opened for writing, including JPEG, HEIC, DNG, TIFF, and RAW. An existing sidecar keeps its other metadata; only the GPS tags are added or replaced.
 
-Coordinates are stored in the catalog. To write them into the files or XMP sidecars, select the photos and use **Metadata > Save Metadata to File** (Cmd/Ctrl+S).
+Lightroom's catalog is updated to the same coordinates. That is what makes the pin show on the map, and it stops a later "save metadata" from overwriting the sidecar with an empty location. **Edit > Undo** reverts the catalog only. It does not delete or restore the `.xmp` files.
 
 ### A large nested folder
 
@@ -134,7 +134,7 @@ Before Apply, the summary states:
 
 Nothing is written until Apply. Dry run never writes.
 
-The catalog write is allowed 120 seconds plus one second per match, and never more than 2 hours. Canceling the write progress stops the loop. Lightroom reports whether the catalog write ran.
+The catalog update is allowed 120 seconds plus one second per match, and never more than 2 hours. Sidecar files are written after that, one at a time, and that step can be canceled. Canceling does not roll back sidecars already written.
 
 ## Project layout
 
@@ -176,3 +176,5 @@ SDK reference: [Lightroom Classic SDK](https://developer.adobe.com/lightroom-cla
 - Several selected folders are rejected rather than merged.
 - Folder scopes do not honor the Library filter bar.
 - Test mode is practical for a few dozen pairs, not for thousands.
+- The image file is never modified. JPEG, HEIC, DNG, and TIFF get a sibling `.xmp` as well; some apps read GPS from inside those formats and ignore the sidecar. Lightroom still shows the catalog coordinates.
+- Undo does not revert sidecar files.
