@@ -481,9 +481,6 @@ function GeoFixCore.classifyFolders(records)
 				return { kind = 'ambiguous' }
 			end
 		end
-		if topId == records[1].id and #records == 1 then
-			return { kind = 'one', id = topId }
-		end
 		return { kind = 'ancestor', id = topId }
 	end
 
@@ -504,6 +501,7 @@ function GeoFixCore.singleRootError(folderCount, scope)
 	if folderCount == 1 then return nil end
 	if folderCount < 1 then
 		return 'Select a single folder in the Folders panel. '
+			.. 'A folder that only contains subfolders is valid. '
 			.. 'The entire-tree and current-folder scopes use that folder as the project. '
 			.. 'Collections and All Photographs are not folder trees. '
 			.. 'To analyze a selection or filmstrip instead, choose Selected photos only.'

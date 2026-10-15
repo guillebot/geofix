@@ -293,15 +293,12 @@ local function folderLabel(path, name)
 	return 'Selected folder'
 end
 
-local function folderEntries(catalog)
+local function entriesFromSources(sources)
 	local entries, seen = {}, {}
-	local sources = sourceList(activeSources(catalog))
 	for _, source in ipairs(sources) do
 		if isFolder(source) and not seen[source] then
 			local path, name = folderPathAndName(source)
-			if path and seen[path] then
-				-- The same folder can show up twice with a different object.
-			else
+			if not (path and seen[path]) then
 				seen[source] = true
 				if path then seen[path] = true end
 				local parent = nil
@@ -315,6 +312,20 @@ local function folderEntries(catalog)
 				}
 			end
 		end
+	end
+	return entries
+end
+
+local function folderEntries(catalog)
+	local sources = sourceList(activeSources(catalog))
+	local entries = entriesFromSources(sources)
+	-- Folder methods can require catalog read access even when the source list does not.
+	if #entries == 0 and #sources > 0 then
+		pcall(function()
+			catalog:withReadAccessDo(function()
+				entries = entriesFromSources(sources)
+			end)
+		end)
 	end
 	logger:info(string.format('active sources=%d folders=%d', #sources, #entries))
 	return entries
