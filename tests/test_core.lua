@@ -270,6 +270,11 @@ near(dateline.matches[1].altitude, 50, 1e-6, 'dateline altitude midpoint')
 
 -- scope, summary, report ------------------------------------------------------
 eq(Core.normalizeScope('nope'), 'tree', 'unknown scope becomes the whole tree')
+eq(Core.normalizeScope('Entire folder tree - one project (recommended)'), 'tree', 'tree menu title stays tree')
+eq(Core.normalizeScope('Current folder only'), 'folder', 'folder menu title stays folder')
+eq(Core.normalizeScope('Selected photos only'), 'selection', 'selection menu title stays selection')
+eq(Core.normalizeScope({ value = 'folder' }), 'folder', 'popup item table uses its value')
+eq(Core.normalizeScope({ title = 'Entire folder tree - one project (recommended)' }), 'tree', 'popup item table falls back to the title')
 eq(Core.scopeChoices()[1].value, 'tree', 'recommended scope is listed first')
 check(Core.scopeChoices()[1].title:find('one project', 1, true) ~= nil, 'scope menu says one project')
 eq(Core.scopeTitle('tree'), 'Entire folder tree - one project', 'tree title')

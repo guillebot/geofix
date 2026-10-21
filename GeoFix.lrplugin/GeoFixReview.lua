@@ -4,9 +4,15 @@ GeoFixReview.lua
 Test mode. Steps through each proposed match and shows the untagged photo next
 to the geotagged donor so the pair can be checked by eye.
 
-Previews come from LrPhoto:requestJpegThumbnail. The bound file path is what
-the picture view actually displays, and it refreshes as you move between pairs.
-f:catalog_photo does not reliably repaint when its photo changes.
+Previews are f:catalog_photo bound to the LrPhoto already in the library
+(targetPhoto / donorPhoto). Lightroom paints the library preview, so this does
+not call requestJpegThumbnail. Encoding a Canon R6 RAW at 800x560 often takes
+longer than a few seconds, and the callback is not delivered if the requesting
+task stops yielding or if the callback itself yields.
+
+catalog_photo ignores an in-place change of the bound photo. Each index change
+clears the property and then sets the LrPhoto again, from a task, after the
+dialog is on screen.
 
 On confirm, plan.matches is replaced with the pairs still checked. Returns
 true only when there is something to write.
@@ -15,7 +21,6 @@ true only when there is something to write.
 local LrBinding = import 'LrBinding'
 local LrDate = import 'LrDate'
 local LrDialogs = import 'LrDialogs'
-local LrPathUtils = import 'LrPathUtils'
 local LrTasks = import 'LrTasks'
 local LrView = import 'LrView'
 
@@ -25,8 +30,6 @@ local logger = require 'GeoFixLogger'
 local bind = LrView.bind
 
 local THUMB_W, THUMB_H = 400, 280
-local REQUEST_W, REQUEST_H = 800, 560
-local PLACEHOLDER = LrPathUtils.child(_PLUGIN.path, 'placeholder.png')
 
 local GeoFixReview = {}
 
@@ -49,7 +52,7 @@ local function formatGps(record)
 	return text
 end
 
-local function photoColumn(f, heading, pathKey, statusKey, nameKey, metaKey)
+local function photoColumn(f, heading, photoKey, statusKey, nameKey, metaKey)
 	return f:column {
 		spacing = f:control_spacing(),
 		width = THUMB_W,
@@ -61,8 +64,8 @@ local function photoColumn(f, heading, pathKey, statusKey, nameKey, metaKey)
 			height_in_lines = 2,
 		},
 
-		f:picture {
-			value = bind(pathKey),
+		f:catalog_photo {
+			photo = bind(photoKey),
 			width = THUMB_W,
 			height = THUMB_H,
 			frame_width = 1,
@@ -103,8 +106,8 @@ function GeoFixReview.show(context, plan, settings)
 	local props = LrBinding.makePropertyTable(context)
 	props.index = 1
 	props.include = true
-	props.targetPath = PLACEHOLDER
-	props.donorPath = PLACEHOLDER
+	props.targetPhoto = nil
+	props.donorPhoto = nil
 	props.targetStatus = ' '
 	props.donorStatus = ' '
 	props.targetName = ''
@@ -137,43 +140,24 @@ function GeoFixReview.show(context, plan, settings)
 		refreshSelectedLabel()
 	end)
 
-	-- The callback is delivered on the task scheduler. Sleeping until it arrives
-	-- (here, and inside the dialog button actions) is what lets the preview
-	-- paint before the user looks at the pair.
-	local function beginThumb(which, photo)
-		tokens[which] = tokens[which] + 1
-		local mine = tokens[which]
-		local state = { done = false }
-		props[which .. 'Path'] = PLACEHOLDER
-		props[which .. 'Status'] = 'Loading preview...'
-		photo:requestJpegThumbnail(REQUEST_W, REQUEST_H, function(path, err)
-			if tokens[which] == mine then
-				if type(path) == 'string' and path ~= '' then
-					props[which .. 'Path'] = path
-					props[which .. 'Status'] = ' '
-				else
-					props[which .. 'Path'] = PLACEHOLDER
-					props[which .. 'Status'] = 'Preview unavailable'
-					logger:warn(string.format('thumbnail failed (%s): %s', which, tostring(err)))
-				end
-			end
-			state.done = true
-		end)
-		return state
-	end
-
-	local function waitForThumbs(states)
-		local waits = 0
-		while waits < 100 do
-			local pending = false
-			for _, state in ipairs(states) do
-				if not state.done then pending = true end
-			end
-			if not pending then return end
-			LrTasks.sleep(0.05)
-			waits = waits + 1
-		end
-		logger:warn('thumbnail request timed out')
+	-- catalog_photo keeps the previous image when the bound LrPhoto is replaced
+	-- in place. Clear both bindings, yield so the views notice, then set the
+	-- photos for this pair. A superseded navigation must not write the pair it
+	-- no longer owns. The sleep runs only from a task (button actions and the
+	-- first paint start one before calling showAt).
+	local function showPhotos(match)
+		tokens.target = tokens.target + 1
+		tokens.donor = tokens.donor + 1
+		local targetMine = tokens.target
+		local donorMine = tokens.donor
+		props.targetPhoto = nil
+		props.donorPhoto = nil
+		props.targetStatus = ' '
+		props.donorStatus = ' '
+		LrTasks.sleep(0.01)
+		if tokens.target ~= targetMine or tokens.donor ~= donorMine then return end
+		props.targetPhoto = match.target.photo
+		props.donorPhoto = match.donor.photo
 	end
 
 	local function showAt(i)
@@ -193,13 +177,7 @@ function GeoFixReview.show(context, plan, settings)
 		suppress = true
 		props.include = included[i] and true or false
 		suppress = false
-		local thumbs = {
-			target = beginThumb('target', match.target.photo),
-			donor = beginThumb('donor', match.donor.photo),
-		}
-		waitForThumbs({ thumbs.target, thumbs.donor })
-		if not thumbs.target.done then props.targetStatus = 'Preview timed out' end
-		if not thumbs.donor.done then props.donorStatus = 'Preview timed out' end
+		showPhotos(match)
 	end
 
 	local counts = plan.counts or { interpolated = 0, nearest = 0, exact = 0 }
@@ -251,8 +229,8 @@ function GeoFixReview.show(context, plan, settings)
 
 		f:row {
 			spacing = f:control_spacing() * 2,
-			photoColumn(f, 'Without GPS  (will receive coordinates)', 'targetPath', 'targetStatus', 'targetName', 'targetMeta'),
-			photoColumn(f, bind 'donorHeading', 'donorPath', 'donorStatus', 'donorName', 'donorMeta'),
+			photoColumn(f, 'Without GPS  (will receive coordinates)', 'targetPhoto', 'targetStatus', 'targetName', 'targetMeta'),
+			photoColumn(f, bind 'donorHeading', 'donorPhoto', 'donorStatus', 'donorName', 'donorMeta'),
 		},
 
 		f:static_text {
@@ -273,7 +251,10 @@ function GeoFixReview.show(context, plan, settings)
 					end,
 				},
 				action = function()
-					if props.index > 1 then showAt(props.index - 1) end
+					if props.index > 1 then
+						local target = props.index - 1
+						LrTasks.startAsyncTask(function() showAt(target) end)
+					end
 				end,
 			},
 			f:push_button {
@@ -285,7 +266,10 @@ function GeoFixReview.show(context, plan, settings)
 					end,
 				},
 				action = function()
-					if props.index < matchCount then showAt(props.index + 1) end
+					if props.index < matchCount then
+						local target = props.index + 1
+						LrTasks.startAsyncTask(function() showAt(target) end)
+					end
 				end,
 			},
 			f:push_button {
@@ -296,13 +280,22 @@ function GeoFixReview.show(context, plan, settings)
 					props.include = false
 					suppress = false
 					refreshSelectedLabel()
-					if props.index < matchCount then showAt(props.index + 1) end
+					if props.index < matchCount then
+						local target = props.index + 1
+						LrTasks.startAsyncTask(function() showAt(target) end)
+					end
 				end,
 			},
 		},
 	}
 
-	showAt(1)
+	-- This task blocks inside presentModalDialog. The preview task does not run
+	-- until that call yields, so the catalog_photo views exist while the photos
+	-- are bound. Setting them before the window is shown does not paint.
+	LrTasks.startAsyncTask(function()
+		LrTasks.sleep(0.05)
+		showAt(1)
+	end)
 
 	local canApply = not settings.dryRun
 	local result = LrDialogs.presentModalDialog {

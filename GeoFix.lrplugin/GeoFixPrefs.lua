@@ -6,6 +6,8 @@ Persisted user settings (stored by Lightroom per plug-in).
 
 local LrPrefs = import 'LrPrefs'
 
+local GeoFixCore = require 'GeoFixCore'
+
 local GeoFixPrefs = {}
 
 GeoFixPrefs.DEFAULTS = {
@@ -39,18 +41,14 @@ local function prefs()
 	return LrPrefs.prefsForPlugin()
 end
 
-local function validScope(value)
-	return value == 'tree' or value == 'folder' or value == 'selection'
-end
-
 --- Copies stored settings (or defaults) into a property table used by the UI.
 function GeoFixPrefs.applyTo(props)
 	local p = prefs()
 	for _, key in ipairs(KEYS) do
 		local v = p[key]
 		if v == nil then v = GeoFixPrefs.DEFAULTS[key] end
-		if key == 'scope' and not validScope(v) then
-			v = GeoFixPrefs.DEFAULTS.scope
+		if key == 'scope' then
+			v = GeoFixCore.normalizeScope(v)
 		end
 		props[key] = v
 	end

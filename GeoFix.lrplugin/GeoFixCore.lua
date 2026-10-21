@@ -406,8 +406,22 @@ function GeoFixCore.formatDuration(seconds)
 end
 
 function GeoFixCore.normalizeScope(scope)
+	-- A popup can hand back the item table or its title instead of the value.
+	if type(scope) == 'table' then
+		if scope.value ~= nil then
+			scope = scope.value
+		else
+			scope = scope.title
+		end
+	end
 	if scope == 'tree' or scope == 'folder' or scope == 'selection' then
 		return scope
+	end
+	if type(scope) == 'string' then
+		-- Match the tree title first. It contains the word "folder".
+		if scope:find('Entire folder tree', 1, true) then return 'tree' end
+		if scope:find('Current folder only', 1, true) then return 'folder' end
+		if scope:find('Selected photos only', 1, true) then return 'selection' end
 	end
 	return 'tree'
 end

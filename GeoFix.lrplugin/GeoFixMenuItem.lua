@@ -12,8 +12,10 @@ Flow:
   6. On confirmation write the coordinates in one undoable step.
 
 Scope:
-  tree      the active folder and every subfolder, as one project. This is the
-            default. Targets and donors are the same set of photos.
+  tree      the active folder and every nested subfolder, as one project. This
+            is the default. Targets and donors are the same set of photos.
+            getPhotos(true) is not trusted on its own: the plug-in also walks
+            getChildren() and unions getPhotos(false) on every descendant.
   folder    photos directly in the active folder. Subfolders are left out.
   selection the current selection. Fewer than two selected photos means the
             whole filmstrip, which includes subfolders only when Lightroom is
@@ -38,14 +40,38 @@ local logger = require 'GeoFixLogger'
 
 local bind = LrView.bind
 
+-- simple_list stores an array of selected item values. Compare each entry so
+-- the project root is highlighted without another click.
+local function listValueEquals(selected, itemValue)
+	if type(selected) ~= 'table' then
+		return selected == itemValue
+	end
+	local n = #selected
+	if n > 0 then
+		for i = 1, n do
+			if selected[i] == itemValue then return true end
+		end
+		return false
+	end
+	for _, entry in pairs(selected) do
+		if entry == itemValue then return true end
+	end
+	return false
+end
+
 local UNIT_ITEMS = {
 	{ title = 'seconds', value = 1 },
 	{ title = 'minutes', value = 60 },
 	{ title = 'hours', value = 3600 },
 }
 
+-- catalog:batchGetRawMetadata accepts only some LrPhoto:getRawMetadata keys.
+-- fileName is getFormattedMetadata, so the batch call throws
+-- Unknown key: "fileName" and aborts. isVirtualCopy is a raw key that this
+-- batch API also rejects (Adobe-confirmed). The display name comes from the
+-- path leaf. An unknown virtual-copy flag is treated as false.
 local META_KEYS = {
-	'fileName', 'path', 'gps', 'gpsAltitude',
+	'path', 'gps', 'gpsAltitude',
 	'dateTimeOriginal', 'dateTimeDigitized', 'dateTime',
 }
 
@@ -53,9 +79,16 @@ local META_KEYS = {
 -- Settings dialog
 --------------------------------------------------------------------------------
 
-local function showSettingsDialog(context)
+local function showSettingsDialog(context, folderItems, folderNote, selectedFolder)
 	local props = LrBinding.makePropertyTable(context)
 	GeoFixPrefs.applyTo(props)
+	props.scope = GeoFixCore.normalizeScope(props.scope)
+	props.folderItems = folderItems or {}
+	if selectedFolder and selectedFolder ~= 'none' then
+		props.folderIndex = { selectedFolder }
+	else
+		props.folderIndex = {}
+	end
 
 	local scopeItems = {}
 	for _, choice in ipairs(GeoFixCore.scopeChoices()) do
@@ -85,8 +118,15 @@ local function showSettingsDialog(context)
 			spacing = f:label_spacing(),
 			f:static_text { title = 'Scope:', alignment = 'right', width = labelWidth },
 			f:popup_menu {
-				value = bind 'scope',
+				bind_to_object = props,
+				value = bind {
+					key = 'scope',
+					bind_to_object = props,
+				},
 				items = scopeItems,
+				value_equal = function(current, itemValue)
+					return GeoFixCore.normalizeScope(current) == itemValue
+				end,
 				width_in_chars = 52,
 			},
 		},
@@ -100,6 +140,28 @@ local function showSettingsDialog(context)
 			},
 			width_in_chars = 82,
 			height_in_lines = 4,
+		},
+
+		f:static_text { title = 'Project folder', font = '<system/bold>' },
+		f:simple_list {
+			bind_to_object = props,
+			items = bind 'folderItems',
+			value = bind 'folderIndex',
+			width = 740,
+			height = 180,
+			value_equal = listValueEquals,
+			enabled = bind {
+				key = 'scope',
+				bind_to_object = props,
+				transform = function(value)
+					return GeoFixCore.normalizeScope(value) ~= 'selection'
+				end,
+			},
+		},
+		f:static_text {
+			title = folderNote or '',
+			width_in_chars = 82,
+			height_in_lines = 3,
 		},
 
 		f:separator { fill_horizontal = 1 },
@@ -202,6 +264,8 @@ local function showSettingsDialog(context)
 	}
 	if result ~= 'ok' then return nil end
 
+	-- Persist the canonical token. A menu title must not be stored as the scope.
+	props.scope = GeoFixCore.normalizeScope(props.scope)
 	GeoFixPrefs.saveFrom(props)
 
 	local value = tonumber(props.maxDeltaValue) or 0
@@ -220,6 +284,7 @@ local function showSettingsDialog(context)
 		selectUpdated = props.selectUpdated and true or false,
 		testMode = props.testMode and true or false,
 		dryRun = props.dryRun and true or false,
+		folderIndex = type(props.folderIndex) == 'table' and props.folderIndex[1] or props.folderIndex,
 	}
 end
 
@@ -240,57 +305,71 @@ local function dedupe(photos)
 	return out
 end
 
-local function activeSources(catalog)
-	local ok, sources = pcall(function() return catalog:getActiveSources() end)
-	if ok and type(sources) == 'table' and #sources > 0 then return sources end
-	local readOk, readSources = pcall(function()
-		local result
-		catalog:withReadAccessDo(function()
-			result = catalog:getActiveSources()
-		end)
-		return result
-	end)
-	if readOk and type(readSources) == 'table' and #readSources > 0 then return readSources end
-	if ok and type(sources) == 'table' then return sources end
-	return {}
-end
-
-local function sourceList(sources)
+local function iterArray(sources)
 	local list = {}
 	if type(sources) ~= 'table' then return list end
-	if #sources > 0 then
-		for _, source in ipairs(sources) do
-			list[#list + 1] = source
+	local n = #sources
+	if n > 0 then
+		for i = 1, n do
+			if sources[i] ~= nil then list[#list + 1] = sources[i] end
 		end
 		return list
 	end
-	for _, source in pairs(sources) do
-		list[#list + 1] = source
+	local numeric = {}
+	for key, source in pairs(sources) do
+		if source ~= nil and type(key) == 'number' then
+			numeric[#numeric + 1] = { key = key, source = source }
+		end
+	end
+	table.sort(numeric, function(a, b) return a.key < b.key end)
+	for _, item in ipairs(numeric) do
+		list[#list + 1] = item.source
+	end
+	if #list == 0 then
+		for _, source in pairs(sources) do
+			if source ~= nil then list[#list + 1] = source end
+		end
 	end
 	return list
 end
 
+-- Catalog calls wait on the catalog. Lightroom's Lua cannot wait inside a plain
+-- pcall; it fails with "We can only wait from within a task". LrTasks.pcall can.
+local function try(fn)
+	local ok, value = LrTasks.pcall(fn)
+	if ok then return value end
+	return nil
+end
+
+local function nonEmpty(value)
+	if type(value) == 'string' and value ~= '' then return value end
+	return nil
+end
+
 local function isFolder(source)
-	if type(source) == 'string' or source == nil then return false end
-	local okChildren, children = pcall(function() return source:getChildFolders() end)
-	if okChildren and type(children) == 'table' then return true end
-	local okPath, path = pcall(function() return source:getPath() end)
-	return okPath and type(path) == 'string' and path ~= ''
+	if source == nil or type(source) == 'string' then return false end
+	return try(function() return source:type() end) == 'LrFolder'
 end
 
 local function folderPathAndName(source)
-	local path, name
-	local okPath, rawPath = pcall(function() return source:getPath() end)
-	if okPath and type(rawPath) == 'string' and rawPath ~= '' then path = rawPath end
-	local okName, rawName = pcall(function() return source:getName() end)
-	if okName and type(rawName) == 'string' and rawName ~= '' then name = rawName end
+	local path = nonEmpty(try(function() return source:getPath() end))
+	local name = nonEmpty(try(function() return source:getName() end))
+	if not name and path then
+		name = path:match('([^\\/]+)[\\/]*$')
+	end
 	return path, name
 end
 
 local function folderLabel(path, name)
-	if type(path) == 'string' and path ~= '' then return path end
-	if type(name) == 'string' and name ~= '' then return name end
-	return 'Selected folder'
+	return nonEmpty(path) or nonEmpty(name) or 'Selected folder'
+end
+
+-- Last path segment. Lightroom paths use \ on Windows and / on Mac.
+local function pathLeaf(path)
+	if type(path) ~= 'string' or path == '' then return nil end
+	local leaf = path:match('([^\\/]+)[\\/]*$')
+	if leaf == nil or leaf == '' or leaf == '.' or leaf == '..' then return nil end
+	return leaf
 end
 
 local function entriesFromSources(sources)
@@ -301,9 +380,8 @@ local function entriesFromSources(sources)
 			if not (path and seen[path]) then
 				seen[source] = true
 				if path then seen[path] = true end
-				local parent = nil
-				local okParent, rawParent = pcall(function() return source:getParent() end)
-				if okParent and isFolder(rawParent) then parent = rawParent end
+				local parent = try(function() return source:getParent() end)
+				if not isFolder(parent) then parent = nil end
 				entries[#entries + 1] = {
 					source = source,
 					path = path,
@@ -316,19 +394,82 @@ local function entriesFromSources(sources)
 	return entries
 end
 
-local function folderEntries(catalog)
-	local sources = sourceList(activeSources(catalog))
-	local entries = entriesFromSources(sources)
-	-- Folder methods can require catalog read access even when the source list does not.
-	if #entries == 0 and #sources > 0 then
-		pcall(function()
-			catalog:withReadAccessDo(function()
-				entries = entriesFromSources(sources)
-			end)
-		end)
+local function listCatalogFolders(catalog, progress)
+	local folders, seen = {}, {}
+	local function add(folder, depth)
+		if progress:isCanceled() then return end
+		if folder == nil or depth > 64 or #folders >= 5000 or seen[folder] then return end
+		seen[folder] = true
+		local path, name = folderPathAndName(folder)
+		local title
+		if depth == 0 then
+			title = folderLabel(path, name)
+		else
+			title = string.rep('> ', depth) .. (name or 'Folder')
+		end
+		folders[#folders + 1] = { source = folder, path = path, name = name, title = title }
+		if #folders % 25 == 0 then
+			progress:setCaption(string.format('Reading folders (%d)', #folders))
+			LrTasks.yield()
+		end
+		local children = try(function() return folder:getChildren() end)
+		for _, child in ipairs(iterArray(children)) do
+			add(child, depth + 1)
+		end
 	end
-	logger:info(string.format('active sources=%d folders=%d', #sources, #entries))
-	return entries
+	local roots = try(function() return catalog:getFolders() end)
+	for _, root in ipairs(iterArray(roots)) do
+		add(root, 0)
+	end
+	return folders
+end
+
+local function loadFolderContext(catalog, progress)
+	local sources = iterArray(try(function() return catalog:getActiveSources() end))
+	local entries = entriesFromSources(sources)
+	progress:setCaption('Reading folders...')
+	local catalogFolders = listCatalogFolders(catalog, progress)
+	logger:info(string.format('active sources=%d folders=%d catalogFolders=%d',
+		#sources, #entries, #catalogFolders))
+	return { sources = sources, entries = entries, catalogFolders = catalogFolders }
+end
+
+local function sameFolder(a, b)
+	if a == nil or b == nil then return false end
+	if a.source == b.source then return true end
+	return a.path ~= nil and a.path == b.path
+end
+
+local function folderMenu(catalogFolders, detected)
+	if detected then
+		local listed = false
+		for _, entry in ipairs(catalogFolders) do
+			if sameFolder(entry, detected) then
+				listed = true
+				break
+			end
+		end
+		if not listed then
+			catalogFolders[#catalogFolders + 1] = {
+				source = detected.source,
+				path = detected.path,
+				name = detected.name,
+				title = folderLabel(detected.path, detected.name),
+			}
+		end
+	end
+	local items, selected = {}, 'none'
+	for i, entry in ipairs(catalogFolders) do
+		local value = 'f' .. tostring(i)
+		items[#items + 1] = { title = entry.title, value = value }
+		if selected == 'none' and sameFolder(entry, detected) then
+			selected = value
+		end
+	end
+	if #items == 0 then
+		items[1] = { title = 'No folders found in this catalog', value = 'none' }
+	end
+	return items, selected
 end
 
 local function chooseFolder(entries)
@@ -359,27 +500,71 @@ local function chooseFolder(entries)
 	return { source = parent, path = path, name = name }, nil
 end
 
-local function collectProject(catalog, settings, folders)
-	if settings.scope == 'selection' then
-		local photos = catalog:getMultipleSelectedOrAllPhotos() or {}
-		return dedupe(photos), 'Current selection / filmstrip', nil
+-- Photos in one folder. Tree scope also walks every descendant.
+-- getPhotos(true) is documented to include subfolders, but some Lightroom
+-- builds ignore the flag and return only the photos stored in that folder.
+-- Each catalog call goes through LrTasks.pcall (see try). These calls must
+-- stay outside withWriteAccessDo.
+local function collectFolderPhotos(folder, includeChildren)
+	local photos = {}
+	local seen = {}
+	local listed = false
+
+	local function addListed(batch)
+		if type(batch) ~= 'table' then return end
+		listed = true
+		for _, photo in ipairs(iterArray(batch)) do
+			photos[#photos + 1] = photo
+		end
 	end
 
-	if not folders then folders = folderEntries(catalog) end
-	local folder, choice = chooseFolder(folders)
-	if not folder then
-		local count = choice == 'none' and 0 or #folders
-		return nil, nil, GeoFixCore.singleRootError(count, settings.scope)
+	local function walk(node, depth)
+		if node == nil or depth > 64 or seen[node] then return end
+		seen[node] = true
+		local nodePath = nonEmpty(try(function() return node:getPath() end))
+		if nodePath then
+			if seen[nodePath] then return end
+			seen[nodePath] = true
+		end
+		addListed(try(function() return node:getPhotos(false) end))
+		if not includeChildren then return end
+		local children = try(function() return node:getChildren() end)
+		for _, child in ipairs(iterArray(children)) do
+			walk(child, depth + 1)
+		end
+		if LrTasks.yield then LrTasks.yield() end
+	end
+
+	walk(folder, 0)
+	if includeChildren then
+		addListed(try(function() return folder:getPhotos(true) end))
+	end
+	if not listed then return nil end
+	return dedupe(photos)
+end
+
+local function collectProject(catalog, settings)
+	if settings.scope == 'selection' then
+		local photos = catalog:getMultipleSelectedOrAllPhotos()
+		if type(photos) ~= 'table' then photos = {} end
+		return dedupe(iterArray(photos)), 'Current selection / filmstrip', nil
+	end
+
+	local folder = settings.projectFolder
+	if not folder or not folder.source then
+		return nil, nil, 'Choose the project folder in the list. A folder that only contains subfolders is listed there too.'
 	end
 
 	local includeChildren = settings.scope == 'tree'
-	local okPhotos, photos = pcall(function()
-		return folder.source:getPhotos(includeChildren)
-	end)
-	if not okPhotos or type(photos) ~= 'table' then
-		return nil, nil, 'Lightroom could not list the photos in the selected folder.\n\n' .. tostring(photos)
+	local photos = collectFolderPhotos(folder.source, includeChildren)
+	if not photos then
+		return nil, nil, 'Lightroom could not list the photos in the selected folder.'
 	end
-	return dedupe(photos), folderLabel(folder.path, folder.name), nil
+	local path, name = folder.path, folder.name
+	if not path and not name then
+		path, name = folderPathAndName(folder.source)
+	end
+	return photos, folderLabel(path, name), nil
 end
 
 local function toRecords(catalog, photos, progress)
@@ -403,11 +588,12 @@ local function toRecords(catalog, photos, progress)
 			records[#records + 1] = {
 				id = photo.localIdentifier,
 				photo = photo,
-				name = m.fileName or ('#' .. tostring(photo.localIdentifier)),
+				name = pathLeaf(m.path) or ('#' .. tostring(photo.localIdentifier)),
 				path = m.path,
 				time = m.dateTimeOriginal or m.dateTimeDigitized or m.dateTime,
 				gps = m.gps,
 				altitude = m.gpsAltitude,
+				virtual = false,
 			}
 		end
 		startAt = stopAt + 1
@@ -555,6 +741,9 @@ local function readSidecar(path)
 	return data, nil
 end
 
+-- Lightroom Classic's Lua leaves os.rename and os.remove nil.
+-- LrFileUtils.move does not overwrite an existing destination, so an existing
+-- sidecar is moved aside and put back if the new file cannot take its place.
 local function replaceSidecar(path, contents)
 	local tmp = path .. '.geofix.tmp'
 	local file, err = io.open(tmp, 'wb')
@@ -562,22 +751,30 @@ local function replaceSidecar(path, contents)
 	local okWrite, writeErr = pcall(function() file:write(contents) end)
 	file:close()
 	if not okWrite then
-		os.remove(tmp)
+		LrFileUtils.delete(tmp)
 		return false, writeErr or 'could not write sidecar'
 	end
-	if os.rename(tmp, path) then return true end
+
 	local backup = path .. '.geofix.bak'
-	os.remove(backup)
-	if not os.rename(path, backup) then
-		os.remove(tmp)
+	if not LrFileUtils.exists(path) then
+		if LrFileUtils.move(tmp, path) then return true end
+		LrFileUtils.delete(tmp)
 		return false, 'could not replace sidecar'
 	end
-	if not os.rename(tmp, path) then
-		os.rename(backup, path)
-		os.remove(tmp)
+
+	if LrFileUtils.exists(backup) then
+		LrFileUtils.delete(backup)
+	end
+	if not LrFileUtils.move(path, backup) then
+		LrFileUtils.delete(tmp)
 		return false, 'could not replace sidecar'
 	end
-	os.remove(backup)
+	if not LrFileUtils.move(tmp, path) then
+		LrFileUtils.move(backup, path)
+		LrFileUtils.delete(tmp)
+		return false, 'could not replace sidecar'
+	end
+	LrFileUtils.delete(backup)
 	return true
 end
 
@@ -692,21 +889,13 @@ local function applyPlan(catalog, plan, settings, context)
 					altitude = m.altitude
 				end
 				updated[#updated + 1] = photo
-				local path = m.target.path
-				if type(path) ~= 'string' or path == '' then
-					local okPath, rawPath = pcall(function() return photo:getRawMetadata('path') end)
-					if okPath and type(rawPath) == 'string' then path = rawPath end
-				end
-				local virtual = false
-				local okVirtual, flag = pcall(function() return photo:getRawMetadata('isVirtualCopy') end)
-				if okVirtual and flag then virtual = true end
 				sidecarUpdates[#sidecarUpdates + 1] = {
-					path = path,
+					path = m.target.path,
 					name = m.target.name,
 					latitude = gps.latitude,
 					longitude = gps.longitude,
 					altitude = altitude,
-					virtual = virtual,
+					virtual = m.target.virtual,
 				}
 			end
 			progress:setPortionComplete(i, total)
@@ -731,7 +920,7 @@ local function applyPlan(catalog, plan, settings, context)
 	logger:info(string.format('updated %d photo(s), sidecars=%d failed=%d', #updated, sidecarsWritten, sidecarsFailed))
 
 	if settings.selectUpdated and #updated > 0 then
-		pcall(function() catalog:setSelectedPhotos(updated[1], updated) end)
+		LrTasks.pcall(function() catalog:setSelectedPhotos(updated[1], updated) end)
 	end
 
 	local msg = string.format(
@@ -754,16 +943,44 @@ end
 -- Main
 --------------------------------------------------------------------------------
 
-local function main(context)
-	-- Read the folder before the settings dialog. A modal dialog can clear the
-	-- Folders-panel selection, which made a selected parent look like no folder.
-	local catalog = LrApplication.activeCatalog()
-	local folders = folderEntries(catalog)
-	local settings = showSettingsDialog(context)
-	if not settings then return end
-	if #folders == 0 then folders = folderEntries(catalog) end
+local function folderByMenuValue(catalogFolders, value)
+	local index = tostring(value or ''):match('^f(%d+)$')
+	index = tonumber(index)
+	if not index then return nil end
+	return catalogFolders[index]
+end
 
-	local photos, sourceLabel, err = collectProject(catalog, settings, folders)
+local function main(context)
+	-- Read the Folders-panel selection before the modal settings dialog opens.
+	local catalog = LrApplication.activeCatalog()
+	local folderProgress = LrProgressScope {
+		title = 'GeoFix: listing folders',
+		functionContext = context,
+	}
+	folderProgress:setCancelable(true)
+	local info = loadFolderContext(catalog, folderProgress)
+	local listCanceled = folderProgress:isCanceled()
+	folderProgress:done()
+	if listCanceled then return end
+
+	local detected, choice = chooseFolder(info.entries)
+	local items, selectedFolder = folderMenu(info.catalogFolders, detected)
+	local note
+	if detected then
+		note = 'Selected in the Folders panel: ' .. folderLabel(detected.path, detected.name)
+			.. '. Pick another row to change the project root.'
+	elseif choice == 'ambiguous' then
+		note = 'Several unrelated folders are selected in the Folders panel. Pick the project root below.'
+	else
+		note = 'No folder is selected in the Folders panel. Pick the project root below.'
+	end
+	local settings = showSettingsDialog(context, items, note, selectedFolder)
+	if not settings then return end
+	if settings.scope ~= 'selection' then
+		settings.projectFolder = folderByMenuValue(info.catalogFolders, settings.folderIndex)
+	end
+
+	local photos, sourceLabel, err = collectProject(catalog, settings)
 	if err then
 		LrDialogs.message('GeoFix', err, 'info')
 		return

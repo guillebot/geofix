@@ -24,14 +24,15 @@ After an update, use **File > Plug-in Manager > Reload Plug-in** (or restart Lig
 
 ## Usage
 
-1. In the Library module, click **one** folder in the Folders panel. That folder is the project root. Do not select several folders, a collection, or All Photographs.
+1. In the Library module, click the project root in the Folders panel.
 2. Run **Library > Plug-in Extras > GeoFix: Fill missing GPS...**
 3. Leave **Scope** on **Entire folder tree - one project (recommended)**.
-4. Click **Analyze**.
-5. Read the summary. It names the scope, the folder, how many photos were read, how many can donate coordinates, how many are missing GPS, and how many will be interpolated versus copied from the nearest photo.
-6. Click **Apply**.
+4. Check **Project folder**. It lists every folder in the catalog, with subfolders marked `>`, and the folder you clicked is already selected. Click another row to change it.
+5. Click **Analyze**.
+6. Read the summary. It names the scope, the folder, how many photos were read, how many can donate coordinates, how many are missing GPS, and how many will be interpolated versus copied from the nearest photo.
+7. Click **Apply**.
 
-The menu stays available even when the root folder looks empty in the grid. A folder that only contains subfolders is a valid project root.
+The menu stays available even when the root folder looks empty in the grid. A folder that only contains subfolders is a valid project root. Selecting the parent together with its subfolders, or only the subfolders of one parent, also resolves to that parent.
 
 Turn on **Dry run** the first time you point it at a large library. Turn on **Save a CSV report** if you want a spreadsheet of every photo before anything is written. Turn on **Test mode** only for a small set: it opens matches one at a time.
 
@@ -150,6 +151,7 @@ GeoFix.lrplugin/
   PluginInfoProvider.lua   panel shown in the Plug-in Manager
 tests/
   test_core.lua            unit tests for GeoFixCore (plain Lua, no Lightroom needed)
+  test_menu_mock.lua       runs the whole menu command against a fake Lightroom SDK
 ```
 
 The log records counts, the scope, and whether a CSV was written. It does not record coordinates or folder paths.
@@ -158,13 +160,16 @@ The log records counts, the scope, and whether a CSV was written. It does not re
 
 Lightroom Classic embeds Lua 5.1. Keep the code compatible with it: no `goto`, no integer division `//`, no bitwise operators, and no `table.unpack`.
 
+Wrap catalog and photo calls in `LrTasks.pcall`, never plain `pcall`. Those calls wait on the catalog, and a wait inside plain `pcall` fails with "We can only wait from within a task". Do not read metadata inside `withWriteAccessDo`; read it first.
+
 The tests run on Lua 5.4 as well. From the repository root:
 
 ```sh
 lua tests/test_core.lua
+lua tests/test_menu_mock.lua
 ```
 
-They cover nearest-photo matching, interpolation, the speed and gap fallbacks, the antimeridian, scope wording, CSV escaping, and a 20,000-photo library. They do not start Lightroom, so folder listing, thumbnail review, and catalog writes still need a pass in Lightroom Classic.
+`test_core.lua` covers nearest-photo matching, interpolation, the speed and gap fallbacks, the antimeridian, scope wording, CSV escaping, XMP merging, and a 20,000-photo library. `test_menu_mock.lua` runs the menu command from folder detection to sidecar writes against a fake SDK that fails the way Lightroom does when a catalog call waits inside plain `pcall` or inside a write. Thumbnail review and the real catalog still need a pass in Lightroom Classic.
 
 SDK reference: [Lightroom Classic SDK](https://developer.adobe.com/lightroom-classic/).
 
